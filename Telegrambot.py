@@ -1,93 +1,134 @@
+import os
 import asyncio
-from telethon.sync import TelegramClient
-from telethon import errors
+import sqlite3
+from datetime import datetime, timedelta
+from telethon import TelegramClient, events
+from dotenv import load_dotenv
 
-class TelegramForwarder:
-    def __init__(self, api_id, api_hash, phone_number):
-        self.api_id = api_id
-        self.api_hash = api_hash
-        self.phone_number = phone_number
-        self.client = TelegramClient(f'session_{phone_number}', api_id, api_hash)
+# Load environment variables
+load_dotenv()
 
-    async def connect_client(self):
-        await self.client.connect()
-        if not await self.client.is_user_authorized():
-            await self.client.send_code_request(self.phone_number)
-            try:
-                await self.client.sign_in(self.phone_number, input('Enter the code: '))
-            except errors.rpcerrorlist.SessionPasswordNeededError:
-                password = input('Two-step verification enabled. Enter password: ')
-                await self.client.sign_in(password=password)
+# Telegram API Credentials
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
-    async def list_chats(self):
-        await self.connect_client()
-        dialogs = await self.client.get_dialogs()
-        
-        with open(f"chats_of_{self.phone_number}.txt", "w", encoding="utf-8") as file:
-            for dialog in dialogs:
-                print(f"Chat ID: {dialog.id}, Title: {dialog.title}")
-                file.write(f"Chat ID: {dialog.id}, Title: {dialog.title}\n")
+# Create the bot client
+client = TelegramClient('adbot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-        print("Chats list saved to file!")
+# Database Setup
+DB_FILE = "adbot.db"
+conn = sqlite3.connect(DB_FILE)
+cursor = conn.cursor()
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS subscriptions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER UNIQUE,
+        expiry_date TEXT,
+        delay INTEGER DEFAULT 5
+    )
+""")
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS targets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        group TEXT
+    )
+""")
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS ads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        message TEXT
+    )
+""")
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS global_settings (
+        id INTEGER PRIMARY KEY,
+        global_delay INTEGER DEFAULT 5
+    )
+""")
+cursor.execute("INSERT OR IGNORE INTO global_settings (id, global_delay) VALUES (1, 5)")
+conn.commit()
+conn.close()
 
-    async def forward_messages(self, source_chat_id, destination_chat_ids, keywords):
-        await self.connect_client()
-        last_message_id = (await self.client.get_messages(source_chat_id, limit=1))[0].id
+# Function to check subscription status
+def is_subscription_active(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT expiry_date FROM subscriptions WHERE user_id = ?", (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+    if result:
+        expiry_date = datetime.strptime(result[0], "%Y-%m-%d %H:%M:%S")
+        return expiry_date > datetime.now()
+    return False
 
-        while True:
-            messages = await self.client.get_messages(source_chat_id, min_id=last_message_id, limit=None)
-
-            for message in reversed(messages):
-                if keywords:
-                    if message.text and any(keyword in message.text.lower() for keyword in keywords):
-                        for dest_chat in destination_chat_ids:
-                            await self.client.send_message(dest_chat, message.text)
-                            print(f"Forwarded to {dest_chat}")
-                else:
-                    for dest_chat in destination_chat_ids:
-                        await self.client.send_message(dest_chat, message.text)
-                        print(f"Forwarded to {dest_chat}")
-
-                last_message_id = max(last_message_id, message.id)
-
-            await asyncio.sleep(5)
-
-def read_credentials():
-    try:
-        with open("credentials.txt", "r") as file:
-            api_id, api_hash, phone_number = [line.strip() for line in file.readlines()]
-            return api_id, api_hash, phone_number
-    except FileNotFoundError:
-        return None, None, None
-
-def write_credentials(api_id, api_hash, phone_number):
-    with open("credentials.txt", "w") as file:
-        file.write(f"{api_id}\n{api_hash}\n{phone_number}\n")
-
-async def main():
-    api_id, api_hash, phone_number = read_credentials()
-
-    if not api_id or not api_hash or not phone_number:
-        api_id = input("Enter your API ID: ")
-        api_hash = input("Enter your API Hash: ")
-        phone_number = input("Enter your phone number: ")
-        write_credentials(api_id, api_hash, phone_number)
-
-    forwarder = TelegramForwarder(api_id, api_hash, phone_number)
-
-    print("1. List Chats\n2. Forward Messages")
-    choice = input("Enter choice: ")
-
-    if choice == "1":
-        await forwarder.list_chats()
-    elif choice == "2":
-        source_chat_id = int(input("Enter source chat ID: "))
-        destination_chat_ids = list(map(int, input("Enter destination chat IDs (comma-separated): ").split(",")))
-        keywords = input("Enter keywords (comma-separated, leave blank for all): ").split(",") if input().strip() else []
-        await forwarder.forward_messages(source_chat_id, destination_chat_ids, keywords)
-    else:
-        print("Invalid choice")
-
-if __name__ == "__main__":
-    asyncio.run(main())
+# Function to send subscription reminders
+async def send_reminders():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, expiry_date FROM subscriptions")
+    subscriptions = cursor.fetchall()
+    conn.close()
     
+    for user_id, expiry_date in subscriptions:
+        expiry = datetime.strptime(expiry_date, "%Y-%m-%d %H:%M:%S")
+        remaining_days = (expiry - datetime.now()).days
+        if remaining_days in [3, 1]:  # Send reminders 3 days and 1 day before expiry
+            await client.send_message(user_id, f"⚠️ Reminder: Your subscription expires in {remaining_days} days! Please renew to continue your service.")
+            await client.send_message(ADMIN_ID, f"🔔 Subscription for {user_id} is expiring in {remaining_days} days.")
+
+# Command to add an ad message
+@client.on(events.NewMessage(pattern='/addad'))
+async def add_ad(event):
+    message = event.message.text.split(" ", 1)[1] if len(event.message.text.split(" ", 1)) > 1 else None
+    if not message:
+        await event.reply("Usage: /addad <ad message>")
+        return
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO ads (user_id, message) VALUES (?, ?)", (event.sender_id, message))
+    conn.commit()
+    conn.close()
+    await event.reply("✅ Ad message added!")
+
+# Command to list all ad messages
+@client.on(events.NewMessage(pattern='/listads'))
+async def list_ads(event):
+    user_id = event.sender_id
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT message FROM ads WHERE user_id = ?", (user_id,))
+    ads = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    ad_list = '\n'.join(ads) if ads else "No ads set. Use /addad to add messages."
+    await event.reply(f"📢 Your Ad Messages:\n{ad_list}")
+
+# Command to get bot stats (admin only)
+@client.on(events.NewMessage(pattern='/stats'))
+async def stats(event):
+    if event.sender_id != ADMIN_ID:
+        return
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM subscriptions")
+    subs_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM ads")
+    ads_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM targets")
+    targets_count = cursor.fetchone()[0]
+    conn.close()
+    stats_text = f"📊 *Bot Statistics:*\n\n👥 Subscribed Users: {subs_count}\n📢 Ads Created: {ads_count}\n🎯 Target Groups: {targets_count}"
+    await event.reply(stats_text)
+
+# Run the bot and schedule reminders
+async def main():
+    while True:
+        await send_reminders()
+        await asyncio.sleep(86400)  # Run once per day
+
+client.loop.create_task(main())
+print("✅ Bot is running...")
+client.run_until_disconnected()
